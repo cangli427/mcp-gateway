@@ -1,0 +1,30 @@
+# MCP Gateway Core
+mcp
+uvicorn
+python-dotenv
+starlette
+pydantic
+requests
+websockets
+
+# Database
+supabase
+
+# LLM SDK
+openai
+
+# Vector Memory (Mem0 + Pinecone dual-write)
+mem0ai
+pinecone
+
+# Web Search
+tavily-python
+duckduckgo-search
+
+# Google Integration (Gmail / Calendar)
+google-auth
+google-auth-httplib2
+google-api-python-client
+
+# Multimedia (AI Music / Cover, optional)
+replicate
