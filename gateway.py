@@ -88,10 +88,10 @@ class HostFixMiddleware:
 
     async def __call__(self, scope, receive, send):
         # ---------- NapCat 反向 WebSocket 端点 ----------
-        if scope["type"] == "websocket" and scope["path"] == "/qq-ws":
+        if scope["type"] == "http" and scope["path"] == "/qq-ws":
             await _send_json_resp(send, 200, {
                 "status": "alive", 
-                "message": "这里是 WebSocket 端点。网关服务正常，请使用 ws:// 或 wss:// 连接！"
+                "message": "这里是 QQ 机器人WebSocket 端点。网关服务正常，请使用 ws:// 或 wss:// 连接！"
             })
             return
 
@@ -100,18 +100,29 @@ class HostFixMiddleware:
             # 🔐 加上安全校验：看 NapCat 带过来的 Token 对不对
             headers_dict = {k.decode("utf-8").lower(): v.decode("utf-8") for k, v in scope.get("headers", [])}
             ws_token = headers_dict.get("sec-websocket-protocol", "").strip()
+            # 如果没在 protocol 里，尝试拿常规 auth
+            if not ws_token:
+                auth = headers_dict.get("authorization", "").strip()
+                if auth.lower().startswith("bearer "):
+                    ws_token = auth[7:]
+                else:
+                    ws_token = auth
+
             api_secret = os.environ.get("API_SECRET", "").strip()
             
+            # 如果配了安全密钥，且 Token 对不上
             if api_secret and ws_token != api_secret:
-                _log(f"❌ NapCat WS 连接拒绝：Token 校验失败！客户端带的: {ws_token}")
+                _log(f"❌ NapCat WS 连接被拒绝：Token 不匹配。收到: {ws_token}")
+                # 🚨 遵守 ASGI 规范：WebSocket 握手失败必须发 websocket.close，不能发 http.response
                 await send({"type": "websocket.close", "code": 4003})
                 return
 
+            # Token 校验通过，或者没配秘钥，交给 napcat.py 处理
             try:
                 import napcat
                 await napcat.handle_napcat_ws(scope, receive, send)
             except Exception as e:
-                _log(f"❌ NapCat WS 处理异常: {e}")
+                _log(f"❌ NapCat WS 业务处理异常: {e}")
             return
 
         # 非 HTTP 类型直接透传给下游
