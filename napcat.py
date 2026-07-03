@@ -182,7 +182,10 @@ async def _call_napcat_api(action: str, params: dict = None, timeout: float = 10
     _napcat_ws_pending[echo] = fut
 
     try:
-        await _napcat_ws_send(json.dumps(payload))
+        await _napcat_ws_send({
+            "type": "websocket.send",
+            "text": json.dumps(payload)
+        })
         return await asyncio.wait_for(fut, timeout=timeout)
     except Exception as e:
         _naplog(f"❌ WS API 调用失败 [{action}]: {e}")
