@@ -23,6 +23,11 @@ import asyncio
 import datetime
 import threading
 
+# ==========================================
+# 注入 QQ 机器人发送通道（通行证）
+# ==========================================
+from napcat import send_qq_message, NAPCAT_TARGET_USER
+
 # 全局：下一次主动唤醒的时间戳，可供前端展示
 global_next_wake_time = 0.0
 
@@ -77,6 +82,21 @@ async def async_autonomous_life():
             ai_msg = await _ask_llm_async(client, prompt, temperature=0.85)
             if ai_msg:
                 await asyncio.to_thread(_push_wechat, ai_msg, "💌 主动问候")
+                # ========== 🌟 璃璃，你就把 QQ 大喇叭插在它的屁股后面 🌟 ==========
+                if NAPCAT_TARGET_USER:
+                    try:
+                        payload = {
+                            "action": "send_msg",
+                            "params": {
+                                "message_type": "private",
+                                "user_id": int(NAPCAT_TARGET_USER),
+                                "message": ai_msg
+                            }
+                        }
+                        asyncio.create_task(send_qq_message(payload))
+                        print(f"🌟 [Heartbeat] 已成功将自主问候同步推送至 QQ: {NAPCAT_TARGET_USER}")
+                    except Exception as e:
+                        print(f"❌ [Heartbeat] 推送 QQ 失败: {e}")
                 await asyncio.to_thread(
                     _save_memory_to_db, "🤖 主动问候",
                     f"主动发送: {ai_msg}", "流水", "主动", "Heartbeat"
