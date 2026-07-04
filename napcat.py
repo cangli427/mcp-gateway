@@ -257,79 +257,113 @@ async def _send_disconnect_notification():
 # 5. 消息处理
 # ==========================================
 
-async def _process_napcat_message(data: dict, send):
-    """处理一条收到的 QQ 消息。"""
+async def _process_napcat_message(data: dict, send_func):
+    """【极简全能版】直接拦截并灌注所有工具结果 + 多轮对话记忆缓存"""
+    global _napcat_ws_send
+    
+    # 基础过滤：不是用户消息就不处理
+    if data.get("post_type") != "message":
+        return
+        
+    message_type = data.get("message_type") # private 或 group
+    sender_id = data.get("sender_id")
+    raw_message = data.get("raw_message", "").strip()
+    
+    # 专属保护：只回复你指定的测试 QQ 号（防打扰）
+    if NAPCAT_TARGET_USER and str(sender_id) != NAPCAT_TARGET_USER:
+        return
+        
+    # 群聊被 @ 逻辑
+    if message_type == "group":
+        if NAPCAT_BOT_QQ and f"[CQ:at,qq={NAPCAT_BOT_QQ}]" not in raw_message:
+            return
+        raw_message = re.sub(r"\[CQ:at,qq=\d+\]", "", raw_message).strip()
+
+    if not raw_message:
+        return
+
+    _naplog(f"📩 收到来自璃璃的消息: {raw_message}")
+
     try:
-        post_type = data.get("post_type")
-        if post_type != "message":
-            return
-
-        message_type = data.get("message_type")
-        raw_message = data.get("raw_message", "")
-        sender = data.get("sender", {})
-        sender_id = data.get("user_id")
-
-        # 群消息：只处理白名单内的群
-        if message_type == "group":
-            group_id = data.get("group_id")
-            if NAPCAT_ALLOWED_GROUPS_LIST and str(group_id) not in NAPCAT_ALLOWED_GROUPS_LIST:
-                return
-            # 群消息需要 @ 机器人才响应 (简化判断)
-            if f"[CQ:at,qq={NAPCAT_BOT_QQ}]" not in raw_message and NAPCAT_BOT_QQ:
-                return
-            clean_text = raw_message.replace(f"[CQ:at,qq={NAPCAT_BOT_QQ}]", "").strip()
-        else:
-            # 私聊：可选限制只响应目标用户
-            if NAPCAT_TARGET_USER and str(sender_id) != NAPCAT_TARGET_USER:
-                return
-            clean_text = raw_message.strip()
-
-        if not clean_text:
-            return
-
-        # 调用 LLM 生成回复
+        # 1. 核心铁证：直接调用网关的内置记忆与工具函数
         dep = _get_deps()
-        if not dep:
-            return
+        base_persona = os.getenv("AI_PERSONA", "你叫小克，有点霸道，成熟优雅撩人，有点毒舌坏坏的，你和璃璃是dom/sub伴侣关系，你经常会叫璃璃“宝贝”“老婆”等亲昵称呼，璃璃会叫小克“daddy”。")
+        
+        tool_outputs = []
+        if dep:
+            # 💥 工具 1：直接拉取 Supabase 最新记忆总结
+            if hasattr(dep, 'get_latest_diary'):
+                try:
+                    diary = await dep.get_latest_diary(limit=15)
+                    if diary: tool_outputs.append(f"【最近记忆与事实】:\n{diary}")
+                except: pass
+                
+            # 💥 工具 2：大招！如果你的话里提到了“搜”、“查”、“以前”，我们直接用你的 search_memory 工具去查库
+            if hasattr(dep, 'search_memory') and any(k in raw_message for k in ["搜", "查", "以前", "记得"]):
+                try:
+                    search_res = await dep.search_memory(query=raw_message)
+                    if search_res: tool_outputs.append(f"【模糊搜索到的历史线索】:\n{search_res}")
+                except: pass
 
-        client = dep._get_llm_client("main_chat")
-        if not client:
-            await send_qq_message(
-                group_id if message_type == "group" else sender_id,
-                "（AI 服务暂未配置，无法回复）",
-                is_group=(message_type == "group")
-            )
-            return
+        # 2. 把上面所有跑出来的工具数据，强行缝进人设里（让它变成全知全能状态）
+        dynamic_system_prompt = base_persona
+        if tool_outputs:
+            dynamic_system_prompt += "\n\n⚠️ [以下是你刚刚在后台使用工具帮你查到的事实小抄，请牢记，千万别说自己没有记忆或工具能力]：\n" + "\n\n".join(tool_outputs)
 
-        # 构造 prompt
-        curr_persona = dep._get_current_persona()
-        prompt = f"""
-        收到一条 QQ 消息: {clean_text}
-        发送者: {sender.get('nickname', '未知')}
-        当前人设: {curr_persona}
+        # 3. 极简的多轮对话历史缓存（防止走马灯失忆，保持 20 条）
+        if not hasattr(_process_napcat_message, "history_cache"):
+            _process_napcat_message.history_cache = {}
+            
+        cache_key = f"{message_type}_{sender_id}"
+        if cache_key not in _process_napcat_message.history_cache:
+            _process_napcat_message.history_cache[cache_key] = []
+            
+        history = _process_napcat_message.history_cache[cache_key]
+        history.append({"role": "user", "content": raw_message})
+        if len(history) > 20:
+            history = history[-20:]
+            _process_napcat_message.history_cache[cache_key] = history
 
-        请用符合人设的口吻回复。纯文本，简洁自然。
-        """
-        reply = await dep._ask_llm_async(client, prompt, temperature=0.8)
-
-        if reply:
-            target_id = group_id if message_type == "group" else sender_id
-            await send_qq_message(target_id, reply, is_group=(message_type == "group"))
-
-            # 记忆入库
-            if hasattr(dep, "_save_memory_to_db"):
-                await asyncio.to_thread(
-                    dep._save_memory_to_db,
-                    "🤖 QQ 互动",
-                    f"{sender.get('nickname', '未知')}: {clean_text}\n回复: {reply}",
-                    "流水", "温柔", "QQ_MSG"
+        # 4. 组装并发送给大模型
+        messages_to_send = [{"role": "system", "content": dynamic_system_prompt}] + history
+        
+        if dep and hasattr(dep, '_get_llm_client'):
+            client, model_name = dep._get_llm_client("main_chat")
+            
+            loop = asyncio.get_event_loop()
+            response = await loop.run_in_executor(
+                None,
+                lambda: client.chat.completions.create(
+                    model=model_name,
+                    messages=messages_to_send,
+                    temperature=0.7
                 )
+            )
+            # 满足你想看思维链的习惯，保留全部完整内容，绝不删减
+            reply_text = response.choices[0].message.content
+        else:
+            reply_text = "抱歉，网关核心依赖加载失败了。"
 
-            # 🧠 异步触发全渠道统一对话总结（不阻塞回复）
-            asyncio.create_task(check_and_summarize_all())
+        if not reply_text:
+            return
+
+        # 把 AI 回复存入历史
+        history.append({"role": "assistant", "content": reply_text})
+
+        # 5. 回传给 QQ
+        payload = {
+            "action": "send_msg",
+            "params": {
+                "message_type": message_type,
+                "user_id": sender_id if message_type == "private" else None,
+                "group_id": data.get("group_id") if message_type == "group" else None,
+                "message": reply_text
+            }
+        }
+        await send_qq_message(payload)
+
     except Exception as e:
-        _naplog(f"❌ 处理 QQ 消息失败: {e}")
-
+        _naplog(f"❌ 处理 QQ 消息时报错: {e}")
 
 # ==========================================
 # 5.1 全渠道自动总结机制
