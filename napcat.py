@@ -325,10 +325,14 @@ async def _process_napcat_message(data: dict, send_func):
             _process_napcat_message.history_cache[cache_key] = history
 
         # 4. 组装并发送给大模型
-        messages_to_send = [{"role": "system", "content": dynamic_system_prompt}] + history
+         messages_to_send = [{"role": "system", "content": dynamic_system_prompt}] + history
         
         if dep and hasattr(dep, '_get_llm_client'):
-            client, model_name = dep._get_llm_client("main_chat")
+            # 👇 【阿溯帮你改了这里！】不再强行拆分，只用 client 接收对象
+            client = dep._get_llm_client("main_chat")
+            
+            # 👇 模型的名字我们从环境变量里拿（拿不到就默认用 gpt-3.5-turbo，你也可以直接改成你的模型名字符串，比如 "deepseek-chat"）
+            model_name = os.getenv("OPENAI_MODEL_NAME", "deepseek-v4-flash") 
             
             loop = asyncio.get_event_loop()
             response = await loop.run_in_executor(
