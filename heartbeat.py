@@ -85,8 +85,11 @@ async def async_autonomous_life():
                 # ========== 同步推送主动问候到 QQ ==========
                 if NAPCAT_TARGET_USER:
                     try:
-                        asyncio.create_task(send_qq_message(int(NAPCAT_TARGET_USER), ai_msg, is_group=False))
-                        print(f"🌟 [Heartbeat] 已成功将自主问候同步推送至 QQ: {NAPCAT_TARGET_USER}")
+                        result = await send_qq_message(int(NAPCAT_TARGET_USER), ai_msg, is_group=False)
+                        if result is None:
+                            print(f"❌ [Heartbeat] QQ 发送失败：NapCat WS 未连接")
+                        else:
+                            print(f"🌟 [Heartbeat] 已成功将自主问候同步推送至 QQ: {NAPCAT_TARGET_USER}")
                     except Exception as e:
                         print(f"❌ [Heartbeat] 推送 QQ 失败: {e}")
                 await asyncio.to_thread(

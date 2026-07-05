@@ -174,6 +174,7 @@ async def _call_napcat_api(action: str, params: dict = None, timeout: float = 10
     使用 echo 字段做请求-响应匹配。
     """
     if not _napcat_ws_send:
+        _naplog(f"⚠️ WS 未连接，无法调用 API: {action}")
         return None
     echo = f"req_{int(time.time() * 1000)}_{id(params)}"
     payload = {"action": action, "params": params or {}, "echo": echo}
