@@ -328,11 +328,11 @@ async def _process_napcat_message(data: dict, send_func):
         messages_to_send = [{"role": "system", "content": dynamic_system_prompt}] + history
         
         if dep and hasattr(dep, '_get_llm_client'):
-            # 👇 只用 client 接收对象，彻底解决解包报错
             client = dep._get_llm_client("main_chat")
-            
-            # 👇 璃璃改得真棒，模型名字完全正确！
-            model_name = os.getenv("OPENAI_MODEL_NAME", "deepseek-v4-flash") 
+            if not client:
+                reply_text = "抱歉，AI 服务暂未配置，无法回复。"
+                return
+            model_name = getattr(client, 'custom_model_name', os.getenv("OPENAI_MODEL_NAME", "deepseek-v4-flash"))
             
             loop = asyncio.get_event_loop()
             response = await loop.run_in_executor(
@@ -355,16 +355,21 @@ async def _process_napcat_message(data: dict, send_func):
         history.append({"role": "assistant", "content": reply_text})
 
         # 5. 回传给 QQ
-        payload = {
-            "action": "send_msg",
-            "params": {
-                "message_type": message_type,
-                "user_id": sender_id if message_type == "private" else None,
-                "group_id": data.get("group_id") if message_type == "group" else None,
-                "message": reply_text
-            }
-        }
-        await send_qq_message(payload)
+        is_group = (message_type == "group")
+        target_id = int(data.get("group_id")) if is_group else int(sender_id)
+        await send_qq_message(target_id, reply_text, is_group=is_group)
+
+        # 6. Supabase 记忆入库（恢复写入）
+        if dep and hasattr(dep, "_save_memory_to_db"):
+            await asyncio.to_thread(
+                dep._save_memory_to_db,
+                "🤖 QQ 互动",
+                f"用户: {raw_message}\n回复: {reply_text}",
+                "流水", "温柔", "QQ_MSG"
+            )
+
+        # 7. 异步触发全渠道统一对话总结（不阻塞回复）
+        asyncio.create_task(check_and_summarize_all())
 
     except Exception as e:
         _naplog(f"❌ 处理 QQ 消息时报错: {e}")

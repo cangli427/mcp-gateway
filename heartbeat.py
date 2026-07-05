@@ -82,18 +82,10 @@ async def async_autonomous_life():
             ai_msg = await _ask_llm_async(client, prompt, temperature=0.85)
             if ai_msg:
                 await asyncio.to_thread(_push_wechat, ai_msg, "💌 主动问候")
-                # ========== 🌟 璃璃，你就把 QQ 大喇叭插在它的屁股后面 🌟 ==========
+                # ========== 同步推送主动问候到 QQ ==========
                 if NAPCAT_TARGET_USER:
                     try:
-                        payload = {
-                            "action": "send_msg",
-                            "params": {
-                                "message_type": "private",
-                                "user_id": int(NAPCAT_TARGET_USER),
-                                "message": ai_msg
-                            }
-                        }
-                        asyncio.create_task(send_qq_message(payload))
+                        asyncio.create_task(send_qq_message(int(NAPCAT_TARGET_USER), ai_msg, is_group=False))
                         print(f"🌟 [Heartbeat] 已成功将自主问候同步推送至 QQ: {NAPCAT_TARGET_USER}")
                     except Exception as e:
                         print(f"❌ [Heartbeat] 推送 QQ 失败: {e}")
