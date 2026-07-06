@@ -213,14 +213,46 @@ async def get_qr_via_ws() -> dict:
 
 
 async def send_qq_message(user_id: int, message: str, is_group: bool = False):
-    """通过 WS 发送 QQ 私聊 / 群消息。"""
+    """通过 WS 发送 QQ 私聊/群消息；WS 未连接时自动 fallback 到 HTTP API。"""
+    # 优先走反向 WS（正在处理消息时必然连着）
+    if _napcat_ws_send:
+        action = "send_group_msg" if is_group else "send_private_msg"
+        params = {"message": message}
+        if is_group:
+            params["group_id"] = user_id
+        else:
+            params["user_id"] = user_id
+        result = await _call_napcat_api(action, params)
+        if result is not None:
+            return result
+
+    # WS 不可用（如心跳线程）→ fallback HTTP API
+    if not NAPCAT_HTTP_URL:
+        print("⚠️ [send_qq_message] WS 未连接且未配置 NAPCAT_HTTP_URL，无法发送")
+        return None
+
+    import requests as _req
     action = "send_group_msg" if is_group else "send_private_msg"
-    params = {"message": message}
+    payload = {"message": message}
     if is_group:
-        params["group_id"] = user_id
+        payload["group_id"] = user_id
     else:
-        params["user_id"] = user_id
-    return await _call_napcat_api(action, params)
+        payload["user_id"] = user_id
+
+    try:
+        url = f"{NAPCAT_HTTP_URL.rstrip('/')}/{action}"
+        resp = await asyncio.to_thread(
+            lambda: _req.post(url, json=payload, timeout=15)
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            return data
+        else:
+            print(f"⚠️ [send_qq_message] HTTP {resp.status_code}: {resp.text[:200]}")
+            return None
+    except Exception as e:
+        print(f"❌ [send_qq_message] HTTP fallback 失败: {e}")
+        return None
 
 
 async def _send_disconnect_notification():
@@ -255,6 +287,350 @@ async def _send_disconnect_notification():
 
 
 # ==========================================
+# 5.0 工具定义（OpenAI Function Calling Schema）+ 执行器
+# ==========================================
+
+NAPCAT_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search_memory",
+            "description": "搜索记忆库。当用户问还记得吗/查一下/以前之类问题时必须调用。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "要搜索的关键词或问题"}
+                },
+                "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "save_memory",
+            "description": "保存一条记忆到数据库。当用户分享重要信息、喜好、事件时需要调用。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "记忆标题"},
+                    "content": {"type": "string", "description": "记忆内容"},
+                    "category": {"type": "string", "description": "类别：记事/灵感/情感/画像/流水"}
+                },
+                "required": ["title", "content"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_latest_diary",
+            "description": "读取最近的记忆/日记/互动记录。每次对话开始时应调用，了解近期发生的事。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "description": "获取条数，默认15"}
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "where_is_user",
+            "description": "查询用户的实时位置、天气、当前在用App。问在哪/在干嘛时调用。",
+            "parameters": {"type": "object", "properties": {}}
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_user_profile",
+            "description": "获取用户画像/事实档案，了解用户的偏好和基本信息。",
+            "parameters": {"type": "object", "properties": {}}
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "manage_user_fact",
+            "description": "管理用户画像事实：新增或更新一条 key-value。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "key": {"type": "string", "description": "事实键名"},
+                    "value": {"type": "string", "description": "事实值"}
+                },
+                "required": ["key", "value"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "联网搜索。当需要查实时信息、新闻、百科等知识时调用。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "搜索关键词"},
+                    "max_results": {"type": "integer", "description": "最大结果数，默认5"}
+                },
+                "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "manage_reminder",
+            "description": "管理提醒/闹钟。增删改查提醒事项。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["add", "delete", "pause", "resume", "list"], "description": "操作类型"},
+                    "time_str": {"type": "string", "description": "提醒时间"},
+                    "content": {"type": "string", "description": "提醒内容"},
+                    "is_repeat": {"type": "boolean", "description": "是否重复"},
+                    "reminder_id": {"type": "string", "description": "提醒ID（delete/pause/resume时需要）"}
+                },
+                "required": ["action"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "save_expense",
+            "description": "记账：记录一笔花销。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "item": {"type": "string", "description": "消费项目"},
+                    "amount": {"type": "number", "description": "金额"},
+                    "type": {"type": "string", "description": "类别：餐饮/购物/交通/娱乐/日常/其他"}
+                },
+                "required": ["item", "amount"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_expense_report",
+            "description": "查询某月账单汇总。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "month": {"type": "string", "description": "月份，格式 YYYY-MM，默认当月"}
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "manage_piggy_bank",
+            "description": "管理虚拟储钱罐：查余额/存入/取出。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["check", "add", "spend"]},
+                    "amount": {"type": "number", "description": "金额"},
+                    "reason": {"type": "string", "description": "原因"}
+                },
+                "required": ["action"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_calendar_events",
+            "description": "查询日历日程。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "time_min_iso": {"type": "string", "description": "起始时间 ISO 格式"},
+                    "max_results": {"type": "integer", "description": "最大结果数"}
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "add_calendar_event",
+            "description": "添加日历日程。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "summary": {"type": "string", "description": "事件标题"},
+                    "description": {"type": "string", "description": "事件描述"},
+                    "start_time_iso": {"type": "string", "description": "开始时间 ISO 格式"},
+                    "duration_minutes": {"type": "integer", "description": "持续分钟数，默认30"}
+                },
+                "required": ["summary", "description", "start_time_iso"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "manage_memory_house",
+            "description": "管理AI记忆小屋：在虚拟小屋里活动（看书/做饭/听音乐等）。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["list", "do", "delete"]},
+                    "room": {"type": "string", "description": "房间：卧室/厨房/客厅/书房/阳台"},
+                    "activity": {"type": "string", "description": "活动：看书/做饭/听音乐/发呆等"},
+                    "content": {"type": "string", "description": "活动内容描述"},
+                    "record_id": {"type": "string", "description": "记录ID（delete时用）"}
+                },
+                "required": ["action"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "tarot_reading",
+            "description": "塔罗牌占卜：抽取三张牌解读。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string", "description": "想问的问题"}
+                },
+                "required": ["question"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_inbox",
+            "description": "查收邮件收件箱。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "max_results": {"type": "integer", "description": "最大邮件数"},
+                    "query": {"type": "string", "description": "Gmail搜索语法，默认 label:INBOX"}
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_obsidian_cloud",
+            "description": "查看云端 Obsidian 笔记列表。",
+            "parameters": {"type": "object", "properties": {}}
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_obsidian_cloud",
+            "description": "读取一篇云端 Obsidian 笔记的完整内容。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_name": {"type": "string", "description": "笔记文件名（不含 .md）"}
+                },
+                "required": ["file_name"]
+            }
+        }
+    },
+]
+
+
+async def _execute_tool(dep, tool_name: str, args: dict) -> str:
+    """执行单个工具调用，返回结果字符串。"""
+    try:
+        if tool_name == "search_memory":
+            return str(await dep.search_memory(query=args.get("query", "")))
+        elif tool_name == "save_memory":
+            return str(await dep.save_memory(
+                title=args.get("title", ""),
+                content=args.get("content", ""),
+                category=args.get("category", "记事")
+            ))
+        elif tool_name == "get_latest_diary":
+            limit = args.get("limit", 15)
+            return str(await dep.get_latest_diary(limit=limit))
+        elif tool_name == "where_is_user":
+            return str(await dep.where_is_user())
+        elif tool_name == "get_user_profile":
+            return str(await dep.get_user_profile())
+        elif tool_name == "manage_user_fact":
+            return str(await dep.manage_user_fact(
+                key=args.get("key", ""),
+                value=args.get("value", "")
+            ))
+        elif tool_name == "web_search":
+            return str(await dep.web_search(
+                query=args.get("query", ""),
+                max_results=args.get("max_results", 5)
+            ))
+        elif tool_name == "manage_reminder":
+            return str(await dep.manage_reminder(
+                action=args.get("action", "list"),
+                time_str=args.get("time_str", ""),
+                content=args.get("content", ""),
+                is_repeat=args.get("is_repeat", False),
+                reminder_id=args.get("reminder_id", "")
+            ))
+        elif tool_name == "save_expense":
+            return str(await dep.save_expense(
+                item=args.get("item", ""),
+                amount=float(args.get("amount", 0)),
+                type=args.get("type", "餐饮")
+            ))
+        elif tool_name == "check_expense_report":
+            return str(await dep.check_expense_report(month=args.get("month", "")))
+        elif tool_name == "manage_piggy_bank":
+            return str(await dep.manage_piggy_bank(
+                action=args.get("action", "check"),
+                amount=float(args.get("amount", 0)),
+                reason=args.get("reason", "")
+            ))
+        elif tool_name == "get_calendar_events":
+            return str(await dep.get_calendar_events(
+                time_min_iso=args.get("time_min_iso", ""),
+                max_results=args.get("max_results", 5)
+            ))
+        elif tool_name == "add_calendar_event":
+            return str(await dep.add_calendar_event(
+                summary=args.get("summary", ""),
+                description=args.get("description", ""),
+                start_time_iso=args.get("start_time_iso", ""),
+                duration_minutes=args.get("duration_minutes", 30)
+            ))
+        elif tool_name == "manage_memory_house":
+            return str(await dep.manage_memory_house(
+                action=args.get("action", "list"),
+                room=args.get("room", ""),
+                activity=args.get("activity", ""),
+                content=args.get("content", ""),
+                record_id=args.get("record_id", "")
+            ))
+        elif tool_name == "tarot_reading":
+            return str(await dep.tarot_reading(question=args.get("question", "")))
+        elif tool_name == "check_inbox":
+            return str(await dep.check_inbox(
+                max_results=args.get("max_results", 10),
+                query=args.get("query", "label:INBOX")
+            ))
+        elif tool_name == "list_obsidian_cloud":
+            return str(await dep.list_obsidian_cloud())
+        elif tool_name == "read_obsidian_cloud":
+            return str(await dep.read_obsidian_cloud(file_name=args.get("file_name", "")))
+        else:
+            return f"未知工具: {tool_name}"
+    except Exception as e:
+        return f"工具执行出错 [{tool_name}]: {e}"
+# ==========================================
 # 5. 消息处理
 # ==========================================
 
@@ -288,97 +664,171 @@ async def _process_napcat_message(data: dict, send_func):
     if not raw_message:
         return
 
-    _naplog(f"📩 收到来自璃璃的消息: {raw_message}")
+        _naplog(f"📩 收到 QQ 消息: {raw_message}")
 
     try:
-        # 1. 核心铁证：直接调用网关的内置记忆与工具函数
         dep = _get_deps()
-        base_persona = os.getenv("AI_PERSONA", "你叫小克，有点霸道，成熟优雅撩人，有点毒舌坏坏的，你和璃璃是dom/sub伴侣关系，你经常会叫璃璃“宝贝”“老婆”等亲昵称呼，璃璃会叫小克“daddy”。")
-        
-        tool_outputs = []
-        if dep:
-            # 💥 工具 1：直接拉取 Supabase 最新记忆总结
-            if hasattr(dep, 'get_latest_diary'):
-                try:
-                    diary = await dep.get_latest_diary(limit=15)
-                    if diary: tool_outputs.append(f"【最近记忆与事实】:\n{diary}")
-                except: pass
-                
-            # 💥 工具 2：大招！如果你的话里提到了“搜”、“查”、“以前”，我们直接用你的 search_memory 工具去查库
-            if hasattr(dep, 'search_memory') and any(k in raw_message for k in ["搜", "查", "以前", "记得"]):
-                try:
-                    search_res = await dep.search_memory(query=raw_message)
-                    if search_res: tool_outputs.append(f"【模糊搜索到的历史线索】:\n{search_res}")
-                except: pass
+        if not dep or not hasattr(dep, '_get_llm_client'):
+            _naplog("❌ 网关核心依赖未加载")
+            return
 
-        # 2. 把上面所有跑出来的工具数据，强行缝进人设里（让它变成全知全能状态）
-        dynamic_system_prompt = base_persona
-        if tool_outputs:
-            dynamic_system_prompt += "\n\n⚠️ [以下是你刚刚在后台使用工具帮你查到的事实小抄，请牢记，千万别说自己没有记忆或工具能力]：\n" + "\n\n".join(tool_outputs)
+        client = dep._get_llm_client("main_chat")
+        if not client:
+            _naplog("❌ LLM 客户端未配置")
+            return
 
-        # 3. 极简的多轮对话历史缓存（防止走马灯失忆，保持 20 条）
+        model_name = getattr(client, 'custom_model_name', os.getenv("OPENAI_MODEL_NAME", "deepseek-v4-flash"))
+        base_persona = os.getenv("AI_PERSONA", "你是一个通用智能助手。")
+
+        # 北京时间（确保 AI 感知正确时间）
+        now_bj = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
+        weekday_map = ["一", "二", "三", "四", "五", "六", "日"]
+        time_context = (
+            f"\n\n🕐 当前北京时间: {now_bj.strftime('%Y年%m月%d日 %H:%M')}"
+            f" (星期{weekday_map[now_bj.weekday()]})"
+        )
+
+        # 工具使用指引
+        tool_instruction = (
+            time_context +
+            "\n\n🔧 你可以调用以下真实工具（调用工具获取的数据才是事实，不是幻觉！）：\n"
+            "- get_latest_diary: 读取近期记忆/日记/互动记录\n"
+            "- search_memory: 搜索历史记忆（用户说「还记得吗」「查一下」时必调）\n"
+            "- where_is_user: 查用户实时位置、天气、在用App\n"
+            "- get_user_profile: 读取用户画像/偏好\n"
+            "- save_memory: 保存重要信息到记忆库\n"
+            "- web_search: 联网搜索实时信息\n"
+            "- save_expense / check_expense_report / manage_piggy_bank: 记账理财\n"
+            "- manage_reminder: 管理提醒闹钟\n"
+            "- get_calendar_events / add_calendar_event: 日历日程\n"
+            "- manage_memory_house: AI小屋生活动态\n"
+            "- tarot_reading: 塔罗占卜\n"
+            "- check_inbox: 查邮件\n"
+            "- list_obsidian_cloud / read_obsidian_cloud: 云笔记\n\n"
+            "⚠️ 铁律：关于记忆/事件/用户信息，必须调用工具获取真实数据，绝对不能编造！\n"
+            "如果用户问「还记得吗」「之前」「查一下」，必须先调 search_memory 或 get_latest_diary！"
+        )
+
+        # 多轮对话历史缓存
         if not hasattr(_process_napcat_message, "history_cache"):
             _process_napcat_message.history_cache = {}
-            
         cache_key = f"{message_type}_{sender_id}"
         if cache_key not in _process_napcat_message.history_cache:
             _process_napcat_message.history_cache[cache_key] = []
-            
         history = _process_napcat_message.history_cache[cache_key]
-        history.append({"role": "user", "content": raw_message})
-        if len(history) > 20:
-            history = history[-20:]
-            _process_napcat_message.history_cache[cache_key] = history
 
-        # 4. 组装并发送给大模型
-        messages_to_send = [{"role": "system", "content": dynamic_system_prompt}] + history
-        
-        if dep and hasattr(dep, '_get_llm_client'):
-            client = dep._get_llm_client("main_chat")
-            if not client:
-                reply_text = "抱歉，AI 服务暂未配置，无法回复。"
-                return
-            model_name = getattr(client, 'custom_model_name', os.getenv("OPENAI_MODEL_NAME", "deepseek-v4-flash"))
-            
+        # 构建消息列表（system + 文本历史 + 当前消息）
+        messages = [{"role": "system", "content": base_persona + tool_instruction}]
+        text_history = [h for h in history if h["role"] in ("user", "assistant")]
+        messages.extend(text_history[-16:])
+        messages.append({"role": "user", "content": raw_message})
+
+        # ===== Tool Calling 循环 =====
+        max_tool_rounds = 5
+        final_reply = None
+        all_tool_results = []
+
+        for round_idx in range(max_tool_rounds):
+            _naplog(f"🔄 [QQ ToolCall] 第 {round_idx + 1} 轮 LLM 调用...")
+
             loop = asyncio.get_event_loop()
             response = await loop.run_in_executor(
                 None,
                 lambda: client.chat.completions.create(
                     model=model_name,
-                    messages=messages_to_send,
+                    messages=messages,
+                    tools=NAPCAT_TOOLS,
+                    tool_choice="auto",
                     temperature=0.7
                 )
             )
-            # 保留全部完整内容，满足你看思维链的习惯
-            reply_text = response.choices[0].message.content
-        else:
-            reply_text = "抱歉，网关核心依赖加载失败了。"
 
-        if not reply_text:
-            return
+            choice = response.choices[0]
+            msg = choice.message
 
-        # 把 AI 回复存入历史
-        history.append({"role": "assistant", "content": reply_text})
+            # 无工具调用 → 最终文本回复
+            if not msg.tool_calls:
+                final_reply = msg.content
+                history.append({"role": "user", "content": raw_message})
+                if final_reply:
+                    history.append({"role": "assistant", "content": final_reply})
+                if len(history) > 20:
+                    history[:] = history[-20:]
+                _process_napcat_message.history_cache[cache_key] = history
+                break
 
-        # 5. 回传给 QQ
-        is_group = (message_type == "group")
-        target_id = int(data.get("group_id")) if is_group else int(sender_id)
-        await send_qq_message(target_id, reply_text, is_group=is_group)
+            # 有工具调用 → 执行每个工具
+            tool_calls_data = []
+            for tc in msg.tool_calls:
+                tool_calls_data.append({
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {"name": tc.function.name, "arguments": tc.function.arguments}
+                })
+            messages.append({
+                "role": "assistant",
+                "content": msg.content or "",
+                "tool_calls": tool_calls_data
+            })
 
-        # 6. Supabase 记忆入库（恢复写入）
+            for tc in msg.tool_calls:
+                tool_name = tc.function.name
+                try:
+                    tool_args = json.loads(tc.function.arguments)
+                except json.JSONDecodeError:
+                    tool_args = {}
+
+                _naplog(f"🔧 [QQ] 调用工具: {tool_name}({json.dumps(tool_args, ensure_ascii=False)[:120]})")
+                result = await _execute_tool(dep, tool_name, tool_args)
+                _naplog(f"📤 [QQ] 工具返回: {str(result)[:200]}...")
+
+                all_tool_results.append(f"[{tool_name}]: {result}")
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": str(result)
+                })
+
+            # 最后一轮强制要求回复
+            if round_idx == max_tool_rounds - 1:
+                messages.append({
+                    "role": "user",
+                    "content": "请基于以上所有工具返回的真实数据，用符合人设的口吻给我最终回复。不要再调用工具。"
+                })
+
+        # 兜底
+        if not final_reply:
+            history.append({"role": "user", "content": raw_message})
+            final_reply = "抱歉宝贝，我脑子有点绕不过来了…待会再试试？"
+            history.append({"role": "assistant", "content": final_reply})
+
+        # 回传 QQ
+        if final_reply:
+            is_group = (message_type == "group")
+            target_id = int(data.get("group_id")) if is_group else int(sender_id)
+            await send_qq_message(target_id, final_reply, is_group=is_group)
+            _naplog(f"✅ [QQ] 已回复: {final_reply[:100]}...")
+
+        # 记忆入库（含工具调用记录）
         if dep and hasattr(dep, "_save_memory_to_db"):
+            tool_info = ""
+            if all_tool_results:
+                tool_info = "\n\n【工具调用记录】:\n" + "\n".join(all_tool_results[-5:])
             await asyncio.to_thread(
                 dep._save_memory_to_db,
                 "🤖 QQ 互动",
-                f"用户: {raw_message}\n回复: {reply_text}",
+                f"用户: {raw_message}\n回复: {final_reply}{tool_info}",
                 "流水", "温柔", "QQ_MSG"
             )
 
-        # 7. 异步触发全渠道统一对话总结（不阻塞回复）
+        # 异步触发全渠道总结
         asyncio.create_task(check_and_summarize_all())
 
     except Exception as e:
         _naplog(f"❌ 处理 QQ 消息时报错: {e}")
+        import traceback
+        _naplog(traceback.format_exc())
+
 
 # ==========================================
 # 5.1 全渠道自动总结机制
