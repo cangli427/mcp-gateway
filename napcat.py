@@ -267,7 +267,12 @@ async def _process_napcat_message(data: dict, send_func):
         return
         
     message_type = data.get("message_type") # private 或 group
-    sender_id = data.get("sender_id")
+    # OneBot 格式：发送者 ID 在 sender.user_id（嵌套），不在顶层 sender_id
+    sender = data.get("sender", {})
+    sender_id = sender.get("user_id") or data.get("user_id")
+    if sender_id is None:
+        _naplog(f"⚠️ 无法解析发送者 ID，消息数据: {json.dumps(data, ensure_ascii=False)[:200]}")
+        return
     raw_message = data.get("raw_message", "").strip()
     
     # 专属保护：只回复你指定的测试 QQ 号（防打扰）
