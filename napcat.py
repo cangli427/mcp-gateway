@@ -44,7 +44,8 @@ NAPCAT_ALLOWED_GROUPS = os.environ.get("NAPCAT_ALLOWED_GROUPS", "").strip()
 # 通知 QQ 列表
 NAPCAT_NOTIFY_QQ_LIST = [x.strip() for x in NAPCAT_NOTIFY_QQ.split(",") if x.strip()]
 # Telegram 通知列表 (可选，逗号分隔)
-NAPCAT_NOTIFY_TG_LIST = [x.strip() for x in os.environ.get("NAPCAT_NOTIFY_TG", "").split(",") if x.strip()]
+# 🗑️ [已移除] Telegram 推送通道，仅保留 QQ 通知
+# NAPCAT_NOTIFY_TG_LIST = [x.strip() for x in os.environ.get("NAPCAT_NOTIFY_TG", "").split(",") if x.strip()]
 
 # 允许响应的群列表
 NAPCAT_ALLOWED_GROUPS_LIST = [x.strip() for x in NAPCAT_ALLOWED_GROUPS.split(",") if x.strip()]
@@ -212,10 +213,11 @@ async def get_qr_via_ws() -> dict:
     return None
 
 
-async def send_qq_message(user_id: int, message: str, is_group: bool = False):
-    """通过 WS 发送 QQ 私聊/群消息；WS 未连接时自动 fallback 到 HTTP API。"""
-    # 优先走反向 WS（正在处理消息时必然连着）
-    if _napcat_ws_send:
+async def send_qq_message(user_id: int, message: str, is_group: bool = False, force_http: bool = False):
+    """发送 QQ 消息。默认走反向 WS（处理消息时），force_http=True 或 WS 不可用时走 HTTP API。"""
+
+    # 非强制 HTTP 时先尝试 WS
+    if not force_http and _napcat_ws_send:
         action = "send_group_msg" if is_group else "send_private_msg"
         params = {"message": message}
         if is_group:
@@ -226,9 +228,9 @@ async def send_qq_message(user_id: int, message: str, is_group: bool = False):
         if result is not None:
             return result
 
-    # WS 不可用（如心跳线程）→ fallback HTTP API
+    # HTTP API 路径（force_http=True 或 WS 失败/不可用）
     if not NAPCAT_HTTP_URL:
-        print("⚠️ [send_qq_message] WS 未连接且未配置 NAPCAT_HTTP_URL，无法发送")
+        print("⚠️ [send_qq_message] 无法发送：WS 不可用且未配置 NAPCAT_HTTP_URL")
         return None
 
     import requests as _req
@@ -241,17 +243,19 @@ async def send_qq_message(user_id: int, message: str, is_group: bool = False):
 
     try:
         url = f"{NAPCAT_HTTP_URL.rstrip('/')}/{action}"
+        print(f"📤 [send_qq_message] HTTP POST {url} | user_id={user_id}")
         resp = await asyncio.to_thread(
             lambda: _req.post(url, json=payload, timeout=15)
         )
         if resp.status_code == 200:
             data = resp.json()
+            print(f"✅ [send_qq_message] HTTP 发送成功: {data}")
             return data
         else:
-            print(f"⚠️ [send_qq_message] HTTP {resp.status_code}: {resp.text[:200]}")
+            print(f"⚠️ [send_qq_message] HTTP {resp.status_code}: {resp.text[:300]}")
             return None
     except Exception as e:
-        print(f"❌ [send_qq_message] HTTP fallback 失败: {e}")
+        print(f"❌ [send_qq_message] HTTP 请求异常: {e}")
         return None
 
 
@@ -275,15 +279,8 @@ async def _send_disconnect_notification():
             except Exception as e:
                 _naplog(f"❌ 发送 QQ 掉线通知失败: {e}")
 
-    # Telegram 通知 (可选)
-    if NAPCAT_NOTIFY_TG_LIST:
-        try:
-            dep = _get_deps()
-            if hasattr(dep, "send_telegram_message"):
-                for tg_chat_id in NAPCAT_NOTIFY_TG_LIST:
-                    await asyncio.to_thread(dep.send_telegram_message, tg_chat_id, message)
-        except Exception as e:
-            _naplog(f"❌ 发送 Telegram 掉线通知失败: {e}")
+    # 🗑️ [已移除] Telegram 掉线通知
+    # 通知已通过 QQ 发送（见上方），Telegram 通道已移除。
 
 
 # ==========================================
@@ -368,40 +365,7 @@ NAPCAT_TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "web_search",
-            "description": "联网搜索。当需要查实时信息、新闻、百科等知识时调用。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "搜索关键词"},
-                    "max_results": {"type": "integer", "description": "最大结果数，默认5"}
-                },
-                "required": ["query"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "manage_reminder",
-            "description": "管理提醒/闹钟。增删改查提醒事项。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "action": {"type": "string", "enum": ["add", "delete", "pause", "resume", "list"], "description": "操作类型"},
-                    "time_str": {"type": "string", "description": "提醒时间"},
-                    "content": {"type": "string", "description": "提醒内容"},
-                    "is_repeat": {"type": "boolean", "description": "是否重复"},
-                    "reminder_id": {"type": "string", "description": "提醒ID（delete/pause/resume时需要）"}
-                },
-                "required": ["action"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "save_expense",
+            "name": "manage_memory_house",
             "description": "记账：记录一笔花销。",
             "parameters": {
                 "type": "object",
@@ -446,37 +410,6 @@ NAPCAT_TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "get_calendar_events",
-            "description": "查询日历日程。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "time_min_iso": {"type": "string", "description": "起始时间 ISO 格式"},
-                    "max_results": {"type": "integer", "description": "最大结果数"}
-                }
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "add_calendar_event",
-            "description": "添加日历日程。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "summary": {"type": "string", "description": "事件标题"},
-                    "description": {"type": "string", "description": "事件描述"},
-                    "start_time_iso": {"type": "string", "description": "开始时间 ISO 格式"},
-                    "duration_minutes": {"type": "integer", "description": "持续分钟数，默认30"}
-                },
-                "required": ["summary", "description", "start_time_iso"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "manage_memory_house",
             "description": "管理AI记忆小屋：在虚拟小屋里活动（看书/做饭/听音乐等）。",
             "parameters": {
@@ -489,56 +422,6 @@ NAPCAT_TOOLS = [
                     "record_id": {"type": "string", "description": "记录ID（delete时用）"}
                 },
                 "required": ["action"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "tarot_reading",
-            "description": "塔罗牌占卜：抽取三张牌解读。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "question": {"type": "string", "description": "想问的问题"}
-                },
-                "required": ["question"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "check_inbox",
-            "description": "查收邮件收件箱。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "max_results": {"type": "integer", "description": "最大邮件数"},
-                    "query": {"type": "string", "description": "Gmail搜索语法，默认 label:INBOX"}
-                }
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "list_obsidian_cloud",
-            "description": "查看云端 Obsidian 笔记列表。",
-            "parameters": {"type": "object", "properties": {}}
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "read_obsidian_cloud",
-            "description": "读取一篇云端 Obsidian 笔记的完整内容。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "file_name": {"type": "string", "description": "笔记文件名（不含 .md）"}
-                },
-                "required": ["file_name"]
             }
         }
     },
@@ -568,45 +451,6 @@ async def _execute_tool(dep, tool_name: str, args: dict) -> str:
                 key=args.get("key", ""),
                 value=args.get("value", "")
             ))
-        elif tool_name == "web_search":
-            return str(await dep.web_search(
-                query=args.get("query", ""),
-                max_results=args.get("max_results", 5)
-            ))
-        elif tool_name == "manage_reminder":
-            return str(await dep.manage_reminder(
-                action=args.get("action", "list"),
-                time_str=args.get("time_str", ""),
-                content=args.get("content", ""),
-                is_repeat=args.get("is_repeat", False),
-                reminder_id=args.get("reminder_id", "")
-            ))
-        elif tool_name == "save_expense":
-            return str(await dep.save_expense(
-                item=args.get("item", ""),
-                amount=float(args.get("amount", 0)),
-                type=args.get("type", "餐饮")
-            ))
-        elif tool_name == "check_expense_report":
-            return str(await dep.check_expense_report(month=args.get("month", "")))
-        elif tool_name == "manage_piggy_bank":
-            return str(await dep.manage_piggy_bank(
-                action=args.get("action", "check"),
-                amount=float(args.get("amount", 0)),
-                reason=args.get("reason", "")
-            ))
-        elif tool_name == "get_calendar_events":
-            return str(await dep.get_calendar_events(
-                time_min_iso=args.get("time_min_iso", ""),
-                max_results=args.get("max_results", 5)
-            ))
-        elif tool_name == "add_calendar_event":
-            return str(await dep.add_calendar_event(
-                summary=args.get("summary", ""),
-                description=args.get("description", ""),
-                start_time_iso=args.get("start_time_iso", ""),
-                duration_minutes=args.get("duration_minutes", 30)
-            ))
         elif tool_name == "manage_memory_house":
             return str(await dep.manage_memory_house(
                 action=args.get("action", "list"),
@@ -615,17 +459,8 @@ async def _execute_tool(dep, tool_name: str, args: dict) -> str:
                 content=args.get("content", ""),
                 record_id=args.get("record_id", "")
             ))
-        elif tool_name == "tarot_reading":
-            return str(await dep.tarot_reading(question=args.get("question", "")))
-        elif tool_name == "check_inbox":
-            return str(await dep.check_inbox(
-                max_results=args.get("max_results", 10),
-                query=args.get("query", "label:INBOX")
-            ))
-        elif tool_name == "list_obsidian_cloud":
-            return str(await dep.list_obsidian_cloud())
-        elif tool_name == "read_obsidian_cloud":
-            return str(await dep.read_obsidian_cloud(file_name=args.get("file_name", "")))
+        # 🗑️ [已移除] 以下工具分支: web_search, manage_reminder, get_calendar_events,
+        #    add_calendar_event, tarot_reading, check_inbox, list_obsidian_cloud, read_obsidian_cloud
         else:
             return f"未知工具: {tool_name}"
     except Exception as e:
@@ -697,14 +532,10 @@ async def _process_napcat_message(data: dict, send_func):
             "- where_is_user: 查用户实时位置、天气、在用App\n"
             "- get_user_profile: 读取用户画像/偏好\n"
             "- save_memory: 保存重要信息到记忆库\n"
-            "- web_search: 联网搜索实时信息\n"
+            "- manage_user_fact: 管理用户画像事实\n"
             "- save_expense / check_expense_report / manage_piggy_bank: 记账理财\n"
-            "- manage_reminder: 管理提醒闹钟\n"
-            "- get_calendar_events / add_calendar_event: 日历日程\n"
             "- manage_memory_house: AI小屋生活动态\n"
-            "- tarot_reading: 塔罗占卜\n"
-            "- check_inbox: 查邮件\n"
-            "- list_obsidian_cloud / read_obsidian_cloud: 云笔记\n\n"
+            "- send_email_via_api: 发送邮件\n\n"
             "⚠️ 铁律：关于记忆/事件/用户信息，必须调用工具获取真实数据，绝对不能编造！\n"
             "如果用户问「还记得吗」「之前」「查一下」，必须先调 search_memory 或 get_latest_diary！"
         )

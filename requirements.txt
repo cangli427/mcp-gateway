@@ -17,14 +17,10 @@ openai
 mem0ai
 pinecone
 
-# Web Search
-tavily-python
-duckduckgo-search
-
-# Google Integration (Gmail / Calendar)
-google-auth
-google-auth-httplib2
-google-api-python-client
-
-# Multimedia (AI Music / Cover, optional)
-replicate
+# 🗑️ [已移除] 以下依赖对应的功能已下线:
+# tavily-python         → web_search 已移除
+# duckduckgo-search     → web_search 已移除
+# google-auth           → Gmail/Calendar 已移除
+# google-auth-httplib2  → Gmail/Calendar 已移除
+# google-api-python-client → Gmail/Calendar 已移除
+# replicate             → AI音乐/翻唱已移除

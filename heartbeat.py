@@ -1,21 +1,16 @@
 """
-通用后台心跳模块 (Generic Background Heartbeat)
-===============================================
+通用后台心跳模块 (Generic Background Heartbeat) - 瘦身版
+=========================================================
 负责启动一系列后台异步协程 (运行在独立 daemon 线程中)：
 - 自主生命循环：定时主动思考/问候
-- Telegram 轮询：接收并处理用户消息
+- 每日日记生成：深夜自动整理昨日记忆
 - 消息总结器：定期汇总未处理消息
-- 提醒巡视器：检查数据库闹钟并触发
-- 日程小秘书：每日早晚播报日历
-- 信箱巡视器：检查新邮件
 - 环境变量同步：从数据库热更新配置
 
 所有协程均通过延迟导入 (函数内 import) 避免 server.py 的循环依赖。
-所有个性化内容 (人设 / 用户名 / 时区) 均从环境变量读取。
 """
 
 import os
-import re
 import json
 import time
 import random
@@ -82,12 +77,12 @@ async def async_autonomous_life():
             ai_msg = await _ask_llm_async(client, prompt, temperature=0.85)
             if ai_msg:
                 await asyncio.to_thread(_push_wechat, ai_msg, "💌 主动问候")
-                # ========== 同步推送主动问候到 QQ ==========
+                # ========== 同步推送主动问候到 QQ（强制 HTTP，心跳不在 WS 线程内）==========
                 if NAPCAT_TARGET_USER:
                     try:
-                        result = await send_qq_message(int(NAPCAT_TARGET_USER), ai_msg, is_group=False)
+                        result = await send_qq_message(int(NAPCAT_TARGET_USER), ai_msg, is_group=False, force_http=True)
                         if result is None:
-                            print(f"❌ [Heartbeat] QQ 发送失败：NapCat WS 未连接")
+                            print(f"❌ [Heartbeat] QQ 发送失败（HTTP 也未成功，检查 NAPCAT_HTTP_URL）")
                         else:
                             print(f"🌟 [Heartbeat] 已成功将自主问候同步推送至 QQ: {NAPCAT_TARGET_USER}")
                     except Exception as e:
@@ -170,6 +165,17 @@ async def _perform_deep_dreaming():
                 MemoryType.EMOTION, "平静", "Core_Cognition"
             )
             await asyncio.to_thread(_send_email_helper, f"📔 日记总结 ({yesterday})", summary)
+            # ========== 同步推送日记总结到 QQ ==========
+            diary_preview = summary[:500] + ("..." if len(summary) > 500 else "")
+            if NAPCAT_TARGET_USER:
+                try:
+                    result = await send_qq_message(int(NAPCAT_TARGET_USER), f"📔 昨日日记回顾:\n\n{diary_preview}", is_group=False, force_http=True)
+                    if result is None:
+                        print(f"❌ [DeepDream] QQ 发送日记失败")
+                    else:
+                        print(f"🌙 [DeepDream] 日记已同步推送至 QQ")
+                except Exception as e:
+                    print(f"❌ [DeepDream] 推送 QQ 失败: {e}")
             print(f"✅ 日记已生成并归档: 📅 昨日回溯: {yesterday}")
         else:
             print("⚠️ 日记生成失败（LLM 返回空），跳过后续宏观收束。")
@@ -206,6 +212,11 @@ async def _perform_deep_dreaming():
                             MemoryType.EMOTION, "温情", "Core_Cognition_Weekly"
                         )
                         await asyncio.to_thread(_send_email_helper, "📦 每周深度记忆归档", week_summary)
+                        if NAPCAT_TARGET_USER:
+                            try:
+                                await send_qq_message(int(NAPCAT_TARGET_USER), f"📚 周度记忆沉淀:\n\n{week_summary[:500]}", is_group=False, force_http=True)
+                            except Exception:
+                                pass
                         print("✅ 周度记忆已沉淀。")
             except Exception as e:
                 print(f"⚠️ 周度总结失败（不影响日记）: {e}")
@@ -231,6 +242,11 @@ async def _perform_deep_dreaming():
                             MemoryType.EMOTION, "感慨", "Core_Cognition_Monthly"
                         )
                         await asyncio.to_thread(_send_email_helper, "📦 每月深度记忆归档", month_summary)
+                        if NAPCAT_TARGET_USER:
+                            try:
+                                await send_qq_message(int(NAPCAT_TARGET_USER), f"🌕 月度记忆沉淀:\n\n{month_summary[:500]}", is_group=False, force_http=True)
+                            except Exception:
+                                pass
                         # 阅后即焚：清理已归档的周总结
                         m_ids = [m['id'] for m in month_res.data]
                         await asyncio.to_thread(lambda: supabase.table("memories").delete().in_("id", m_ids).execute())
@@ -258,6 +274,11 @@ async def _perform_deep_dreaming():
                             MemoryType.EMOTION, "感动", "Core_Cognition_Yearly"
                         )
                         await asyncio.to_thread(_send_email_helper, "📦 年度终极记忆归档", year_summary)
+                        if NAPCAT_TARGET_USER:
+                            try:
+                                await send_qq_message(int(NAPCAT_TARGET_USER), f"🌟 年度回忆录:\n\n{year_summary[:500]}", is_group=False, force_http=True)
+                            except Exception:
+                                pass
                         y_ids = [y['id'] for y in year_res.data]
                         await asyncio.to_thread(lambda: supabase.table("memories").delete().in_("id", y_ids).execute())
                         print(f"✅ 年度记忆已沉淀，清理 {len(y_ids)} 条历史月总结。")
@@ -319,112 +340,11 @@ async def async_diary_worker():
 
 
 # ==========================================
-# 2. Telegram 消息轮询
+# 🗑️ [已移除] Telegram 消息轮询
 # ==========================================
+# async def async_telegram_polling(): ... (Telegram Bot 轮询已移除，仅保留 QQ 通道)
 
-async def async_telegram_polling():
-    """轮询 Telegram Bot 的 getUpdates 接口，接收并处理用户消息。"""
-    from server import (
-        _get_llm_client, _ask_llm_async, _push_wechat,
-        _save_memory_to_db, _get_current_persona,
-        get_latest_diary, where_is_user, mem0_client
-    )
 
-    import requests
-
-    print("📨 Telegram 轮询神经已上线...")
-    token = os.environ.get("TG_BOT_TOKEN", "").strip()
-    if not token:
-        print("⚠️ 未配置 TG_BOT_TOKEN，Telegram 轮询休眠。")
-        return
-
-    base_url = f"https://api.telegram.org/bot{token}"
-    offset = 0
-
-    while True:
-        try:
-            def _get_updates():
-                return requests.get(
-                    f"{base_url}/getUpdates",
-                    params={"timeout": 30, "offset": offset},
-                    timeout=35
-                ).json()
-            data = await asyncio.to_thread(_get_updates)
-
-            if not data.get("ok"):
-                await asyncio.sleep(5)
-                continue
-
-            for update in data.get("result", []):
-                offset = update["update_id"] + 1
-                message = update.get("message")
-                if not message:
-                    continue
-
-                chat_id = message.get("chat", {}).get("id")
-                text = message.get("text", "").strip()
-                if not chat_id or not text:
-                    continue
-
-                # 简单的指令拦截
-                if text.startswith("/"):
-                    await asyncio.to_thread(
-                        lambda: requests.post(
-                            f"{base_url}/sendMessage",
-                            json={"chat_id": chat_id, "text": "收到指令，正在处理..."},
-                            timeout=10
-                        )
-                    )
-                    continue
-
-                # 调用 LLM 生成回复
-                client = _get_llm_client("main_chat")
-                if client:
-                    try:
-                        recent_mem = await get_latest_diary()
-                        curr_loc = await where_is_user()
-                        curr_persona = _get_current_persona()
-
-                        prompt = f"""
-                        用户发来消息: {text}
-                        当前人设: {curr_persona}
-                        近期记录: {recent_mem}
-
-                        请用符合人设的口吻回复用户。纯文本，自然真诚。
-                        """
-                        reply = await _ask_llm_async(client, prompt, temperature=0.8)
-
-                        if reply:
-                            await asyncio.to_thread(
-                                lambda: requests.post(
-                                    f"{base_url}/sendMessage",
-                                    json={"chat_id": chat_id, "text": reply},
-                                    timeout=15
-                                )
-                            )
-                            await asyncio.to_thread(
-                                _save_memory_to_db, "🤖 互动记录",
-                                f"用户: {text}\n回复: {reply}", "流水", "温柔", "TG_MSG"
-                            )
-
-                            # 写入 Mem0 长期记忆
-                            if mem0_client:
-                                try:
-                                    def _add_mem0():
-                                        mem0_client.add([
-                                            {"role": "user", "content": text},
-                                            {"role": "assistant", "content": reply}
-                                        ], user_id=os.environ.get("MEM0_USER_ID", "default"))
-                                    await asyncio.to_thread(_add_mem0)
-                                except Exception as e:
-                                    print(f"Mem0 写入报错: {e}")
-                    except Exception as e:
-                        print(f"❌ TG 回复生成失败: {e}")
-        except Exception as e:
-            print(f"❌ TG 轮询错误: {e}")
-            await asyncio.sleep(5)
-
-        await asyncio.sleep(0.5)
 
 
 # ==========================================
@@ -475,6 +395,16 @@ async def async_message_summarizer():
 
                 if summary:
                     await asyncio.to_thread(_push_wechat, summary, "📋 消息总结")
+                    # ========== 同步推送消息总结到 QQ ==========
+                    if NAPCAT_TARGET_USER:
+                        try:
+                            result = await send_qq_message(int(NAPCAT_TARGET_USER), f"📋 {summary}", is_group=False, force_http=True)
+                            if result is None:
+                                print(f"❌ [Summarizer] QQ 发送失败")
+                            else:
+                                print(f"📋 [Summarizer] 消息总结已同步推送至 QQ")
+                        except Exception as e:
+                            print(f"❌ [Summarizer] 推送 QQ 失败: {e}")
                     await asyncio.to_thread(
                         _save_memory_to_db, "🤖 互动记录",
                         f"发送了消息总结: {summary}", "流水", "尽责", "Summary"
@@ -488,199 +418,28 @@ async def async_message_summarizer():
 
 
 # ==========================================
-# 4. 提醒巡视器
+# 🗑️ [已移除] 提醒巡视器
 # ==========================================
+# async def async_reminder_worker(): ... (提醒巡视器已移除，manage_reminder 功能已下线)
 
-async def async_reminder_worker():
-    """每分钟巡视数据库 reminders 表，到点就触发。"""
-    from server import (
-        _get_llm_client, _ask_llm_async, _push_wechat, _save_memory_to_db,
-        _get_now_bj, _get_current_persona, get_latest_diary, where_is_user, supabase
-    )
 
-    print("⏰ 提醒巡视神经已上线...")
-    while True:
-        try:
-            if supabase:
-                now_bj = _get_now_bj()
-                current_hm = now_bj.strftime("%H:%M")
-                current_date = now_bj.strftime("%Y-%m-%d")
-
-                res = await asyncio.to_thread(
-                    lambda: supabase.table("reminders").select("*").eq("is_paused", False).execute()
-                )
-
-                if res and res.data:
-                    for r in res.data:
-                        r_id = r.get("id")
-                        t_str = r.get("time_str")
-                        raw_msg = r.get("content", "")
-                        repeat = r.get("is_repeat", False)
-                        last_fired = r.get("last_fired", "")
-
-                        if current_hm == t_str and last_fired != current_date:
-                            final_push_text = raw_msg
-
-                            # 尝试用 LLM 生成更自然的提醒文案
-                            client = _get_llm_client("main_chat")
-                            if client:
-                                try:
-                                    curr_persona = _get_current_persona()
-                                    prompt = f"""
-                                    时间: {t_str}
-                                    需提醒内容: 【{raw_msg}】
-                                    当前人设: {curr_persona}
-
-                                    请用符合人设的口吻发一条提醒。自然真诚，不要提"闹钟/定时"。
-                                    纯文本输出。
-                                    """
-                                    ai_msg = await _ask_llm_async(client, prompt, temperature=0.85)
-                                    if ai_msg:
-                                        final_push_text = ai_msg
-                                except Exception as ai_e:
-                                    print(f"❌ 提醒 AI 生成失败，使用兜底文案: {ai_e}")
-
-                            await asyncio.to_thread(_push_wechat, final_push_text, "🔔 提醒")
-                            await asyncio.to_thread(
-                                _save_memory_to_db, "🤖 互动记录",
-                                f"发送提醒: {final_push_text}", "流水", "尽责", "Reminder"
-                            )
-
-                            # 更新触发记录
-                            if repeat:
-                                await asyncio.to_thread(
-                                    lambda: supabase.table("reminders")
-                                    .update({"last_fired": current_date}).eq("id", r_id).execute()
-                                )
-                            else:
-                                await asyncio.to_thread(
-                                    lambda: supabase.table("reminders").delete().eq("id", r_id).execute()
-                                )
-        except Exception:
-            pass
-
-        # 对齐到下一分钟
-        now = datetime.datetime.utcnow()
-        sleep_sec = 60 - now.second + 1
-        await asyncio.sleep(sleep_sec)
 
 
 # ==========================================
-# 5. 日程小秘书
+# 🗑️ [已移除] 日程小秘书 + 日程播报
 # ==========================================
-
-async def async_schedule_secretary():
-    """每日早晚播报 Google 日历日程。"""
-    from server import _get_calendar_service, _push_wechat, TARGET_CALENDAR_ID
-
-    print("📅 日程小秘书已上线...")
-    if not os.environ.get("GOOGLE_USER_TOKEN_JSON"):
-        print("⚠️ 未配置 GOOGLE_USER_TOKEN_JSON，日程播报无法启动。")
-        return
-
-    # 播报时间（本地时区），可通过环境变量调整
-    morning_time = os.environ.get("SCHEDULE_MORNING_TIME", "07:30")
-    evening_time = os.environ.get("SCHEDULE_EVENING_TIME", "22:00")
-
-    while True:
-        try:
-            now_bj = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
-            current_hm = now_bj.strftime("%H:%M")
-
-            if current_hm == morning_time:
-                await _broadcast_schedule(now_bj, "今日", _get_calendar_service, _push_wechat, TARGET_CALENDAR_ID, is_morning=True)
-            elif current_hm == evening_time:
-                tomorrow = now_bj + datetime.timedelta(days=1)
-                await _broadcast_schedule(tomorrow, "明日", _get_calendar_service, _push_wechat, TARGET_CALENDAR_ID, is_morning=False)
-        except Exception as e:
-            print(f"❌ 日程小秘书报错: {e}")
-
-        now = datetime.datetime.utcnow()
-        sleep_sec = 60 - now.second + 1
-        await asyncio.sleep(sleep_sec)
+# async def async_schedule_secretary(): ... (日历日程播报已移除)
+# async def _broadcast_schedule(...): ... (日程播报辅助函数已移除)
 
 
-async def _broadcast_schedule(target_date, label, _get_calendar_service, _push_wechat, calendar_id, is_morning=True):
-    """内部辅助：拉取指定日期的日历并推送。"""
-    day_start = target_date.replace(hour=0, minute=0, second=0).isoformat() + "+08:00"
-    day_end = target_date.replace(hour=23, minute=59, second=59).isoformat() + "+08:00"
-
-    def _get_events():
-        service = _get_calendar_service()
-        return service.events().list(
-            calendarId=calendar_id, timeMin=day_start, timeMax=day_end,
-            singleEvents=True, orderBy='startTime', timeZone='Asia/Shanghai'
-        ).execute().get('items', [])
-
-    events = await asyncio.to_thread(_get_events)
-    greeting = "早安！今天的日程：" if is_morning else f"{label}的日程，提前准备："
-    if events:
-        msg = f"📅 {label}{greeting}\n"
-        for e in events:
-            raw_dt = e['start'].get('dateTime')
-            if not raw_dt:
-                continue
-            dt_start = datetime.datetime.fromisoformat(raw_dt.replace('Z', '+00:00'))
-            if dt_start.tzinfo is None:
-                dt_start = dt_start.replace(tzinfo=datetime.timezone.utc)
-            dt_bj = dt_start.astimezone(datetime.timezone(datetime.timedelta(hours=8)))
-            msg += f"🔹 {dt_bj.strftime('%H:%M')} - {e.get('summary', '未知')}\n"
-        await asyncio.to_thread(_push_wechat, msg, f"📅 {label}日程播报")
-    else:
-        await asyncio.to_thread(_push_wechat, f"📅 {label}没有日程安排，好好休息～", f"📅 {label}日程播报")
 
 
 # ==========================================
-# 6. 信箱巡视器 (邮件)
+# 🗑️ [已移除] 信箱巡视器 (邮件)
 # ==========================================
+# async def async_email_secretary(): ... (信箱巡视器已移除，Gmail 收信功能已下线)
 
-async def async_email_secretary():
-    """定期检查新邮件并通知 (可通过 GMAIL_BRIDGE_URL 配置桥接地址)。"""
-    from server import (
-        _get_llm_client, _push_wechat, _save_memory_to_db,
-        _clean_email_body, MY_EMAIL, http_session
-    )
 
-    print("📭 信箱巡视神经已接入...")
-    BRIDGE_URL = os.environ.get("GMAIL_BRIDGE_URL", "").strip()
-    if not BRIDGE_URL:
-        print("⚠️ 未配置 GMAIL_BRIDGE_URL，信箱巡视暂时休眠。")
-        return
-
-    processed_email_ids = set()
-
-    while True:
-        try:
-            def _fetch():
-                resp = http_session.get(BRIDGE_URL, timeout=20)
-                return resp.json() if resp.status_code == 200 else []
-            raw_new_emails = await asyncio.to_thread(_fetch)
-
-            if raw_new_emails:
-                for mail in raw_new_emails:
-                    mail_id = mail.get('id', '')
-                    if mail_id in processed_email_ids:
-                        continue
-                    # 过滤掉自己发的和系统邮件
-                    sender = mail.get('from', '').lower()
-                    my_email_lower = MY_EMAIL.lower() if MY_EMAIL else ""
-                    if "onboarding@resend.dev" in sender or (my_email_lower and my_email_lower in sender):
-                        processed_email_ids.add(mail_id)
-                        continue
-
-                    # 通知用户收到新邮件
-                    subject = mail.get('subject', '无标题')
-                    tg_msg = f"📧 收到新邮件: {subject} (来自 {mail.get('from', '未知')})"
-                    await asyncio.to_thread(_push_wechat, tg_msg, "📧 信箱提醒")
-                    await asyncio.to_thread(
-                        _save_memory_to_db, "📧 信箱处理",
-                        f"收到邮件: {subject}", "流水", "尽责", "Email_Process"
-                    )
-                    processed_email_ids.add(mail_id)
-        except Exception:
-            pass
-
-        await asyncio.sleep(300)
 
 
 # ==========================================
@@ -732,24 +491,14 @@ def start_autonomous_life():
     """启动所有后台心跳线程 (daemon 模式，主进程退出时自动结束)。"""
     def _run_heartbeat(): asyncio.run(async_autonomous_life())
     def _run_diary(): asyncio.run(async_diary_worker())
-    def _run_tg_polling(): asyncio.run(async_telegram_polling())
+    # 🗑️ [已移除] Telegram 轮询、提醒巡视器、日程秘书、信箱巡视器
     def _run_msg_sum(): asyncio.run(async_message_summarizer())
-    def _run_reminders(): asyncio.run(async_reminder_worker())
-    def _run_email(): asyncio.run(async_email_secretary())
     def _run_env_sync(): asyncio.run(async_env_sync())
-    def _run_schedule(): asyncio.run(async_schedule_secretary())
 
     threading.Thread(target=_run_env_sync, daemon=True).start()
     threading.Thread(target=_run_heartbeat, daemon=True).start()
     threading.Thread(target=_run_diary, daemon=True).start()
-    threading.Thread(target=_run_tg_polling, daemon=True).start()
     threading.Thread(target=_run_msg_sum, daemon=True).start()
-    threading.Thread(target=_run_reminders, daemon=True).start()
-    threading.Thread(target=_run_schedule, daemon=True).start()
-
-    # 信箱巡视默认关闭 (需配置 GMAIL_BRIDGE_URL 才有意义)
-    # 如需启用，取消下一行注释
-    # threading.Thread(target=_run_email, daemon=True).start()
 
     print("🐱 NapCat QQ 端点已就绪 (被动模式)，等待本地 NapCat 通过反向 WS 连接...")
-    print("🌾 所有后台心跳线程已启动。")
+    print("🌾 后台心跳线程已启动 (自主生命 / 日记生成 / 消息总结 / 环境同步)。")
